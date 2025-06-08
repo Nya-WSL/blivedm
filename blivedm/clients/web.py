@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import datetime
+import hashlib
 import logging
+import urllib
 from typing import *
 
 import aiohttp
@@ -16,12 +19,98 @@ __all__ = (
 logger = logging.getLogger('blivedm')
 
 UID_INIT_URL = 'https://api.bilibili.com/x/web-interface/nav'
+WBI_INIT_URL = UID_INIT_URL
 BUVID_INIT_URL = 'https://www.bilibili.com/'
 ROOM_INIT_URL = 'https://api.live.bilibili.com/room/v1/Room/get_info'
 DANMAKU_SERVER_CONF_URL = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo'
 DEFAULT_DANMAKU_SERVER_LIST = [
     {'host': 'broadcastlv.chat.bilibili.com', 'port': 2243, 'wss_port': 443, 'ws_port': 2244}
 ]
+
+
+class _WbiSigner:
+    WBI_KEY_INDEX_TABLE = [
+        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13
+    ]
+    """wbi密码表"""
+
+    def __init__(self, session: Optional[aiohttp.ClientSession]):
+        self._session = session
+
+        # TODO 缓存过期、同一个session可以共享缓存
+        self._wbi_key = ''
+        """缓存的wbi鉴权口令"""
+
+    @property
+    def wbi_key(self):
+        """
+        缓存的wbi鉴权口令
+        """
+        return self._wbi_key
+
+    async def refresh_wbi_key(self):
+        wbi_key = await self._get_wbi_key()
+        if wbi_key != '':
+            self._wbi_key = wbi_key
+
+    async def _get_wbi_key(self):
+        try:
+            async with self._session.get(
+                WBI_INIT_URL,
+                headers={'User-Agent': utils.USER_AGENT},
+            ) as res:
+                if res.status != 200:
+                    logger.warning('WbiSigner failed to get wbi key: status=%d %s', res.status, res.reason)
+                    return ''
+                data = await res.json()
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            logger.exception('WbiSigner failed to get wbi key:')
+            return ''
+
+        try:
+            wbi_img = data['data']['wbi_img']
+            img_key = wbi_img['img_url'].rpartition('/')[2].partition('.')[0]
+            sub_key = wbi_img['sub_url'].rpartition('/')[2].partition('.')[0]
+        except KeyError:
+            logger.warning('WbiSigner failed to get wbi key: data=%s', data)
+            return ''
+
+        shuffled_key = img_key + sub_key
+        wbi_key = []
+        for index in self.WBI_KEY_INDEX_TABLE:
+            if index < len(shuffled_key):
+                wbi_key.append(shuffled_key[index])
+        return ''.join(wbi_key)
+
+    def add_wbi_sign(self, params: dict):
+        if self._wbi_key == '':
+            return params
+
+        wts = str(int(datetime.datetime.now().timestamp()))
+        params_to_sign = {**params, 'wts': wts}
+
+        # 按key字典序排序
+        params_to_sign = {
+            key: params_to_sign[key]
+            for key in sorted(params_to_sign.keys())
+        }
+        # 过滤一些字符
+        for key, value in params_to_sign.items():
+            value = ''.join(
+                ch
+                for ch in str(value)
+                if ch not in "!'()*"
+            )
+            params_to_sign[key] = value
+
+        str_to_sign = urllib.parse.urlencode(params_to_sign) + self._wbi_key
+        w_rid = hashlib.md5(str_to_sign.encode('utf-8')).hexdigest()
+        return {
+            **params,
+            'wts': wts,
+            'w_rid': w_rid
+        }
 
 
 class BLiveClient(ws_base.WebSocketClientBase):
@@ -43,6 +132,7 @@ class BLiveClient(ws_base.WebSocketClientBase):
         heartbeat_interval=30,
     ):
         super().__init__(session, heartbeat_interval)
+        self._wbi_signer = _WbiSigner(self._session)
 
         self._tmp_room_id = room_id
         """用来init_room的临时房间ID，可以用短ID"""
@@ -199,14 +289,20 @@ class BLiveClient(ws_base.WebSocketClientBase):
         return True
 
     async def _init_host_server(self):
+        if self._wbi_signer.wbi_key == '':
+            await self._wbi_signer.refresh_wbi_key()
+            if self._wbi_signer.wbi_key == '':
+                logger.exception('room=%d _init_host_server() failed: no wbi key', self._room_id)
+                return False
+
         try:
             async with self._session.get(
                 DANMAKU_SERVER_CONF_URL,
                 headers={'User-Agent': utils.USER_AGENT},
-                params={
+                params=self._wbi_signer.add_wbi_sign({
                     'id': self._room_id,
                     'type': 0
-                },
+                }),
             ) as res:
                 if res.status != 200:
                     logger.warning('room=%d _init_host_server() failed, status=%d, reason=%s', self._room_id,
