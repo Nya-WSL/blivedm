@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+import asyncio
 from typing import *
 
 from .clients import ws_base
@@ -149,7 +150,7 @@ class BaseHandler(HandlerInterface):
 
         callback = self._CMD_CALLBACK_DICT[cmd]
         if callback is not None:
-            callback(self, client, command)
+            asyncio.create_task(callback(self, client, command))
 
     def _on_heartbeat(self, client: ws_base.WebSocketClientBase, message: web_models.HeartbeatMessage):
         """收到心跳包"""

@@ -10,6 +10,7 @@ from typing import *
 import aiohttp
 import brotli
 
+from aiohttp.resolver import AsyncResolver
 from .. import handlers, utils
 
 logger = logging.getLogger('blivedm')
@@ -93,7 +94,9 @@ class WebSocketClientBase:
         heartbeat_interval: float = 30,
     ):
         if session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+            resolver = AsyncResolver(nameservers=["8.8.8.8", "114.114.114.114"])
+            connector = aiohttp.TCPConnector(resolver=resolver)
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10), connector=connector)
             self._own_session = True
         else:
             self._session = session
